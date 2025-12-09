@@ -1089,7 +1089,18 @@ app.post('/api/recommend', async (req, res) => {
     // ========== RAG STEP 1: RETRIEVAL ==========
     let relevantPOIs = [];
     let retrievedChunks = [];
-    let searchMethod = 'keyword'; // Track which method was used
+    let searchMethod = 'hybrid'; // Track which method was used
+    
+    // Calculate distance parameters
+    let maxDistance = searchRadius;
+    if (queryLower.includes('рядом') || queryLower.includes('близко') || queryLower.includes('пешком')) {
+      maxDistance = Math.min(searchRadius, 2);
+    } else if (queryLower.includes('далеко') || queryLower.includes('на машине')) {
+      maxDistance = Math.max(searchRadius, 20);
+    }
+    
+    // HYBRID APPROACH: Combine vector search + keyword filtering + geo-filtering
+    let vectorCandidates = [];
     let vectorSearchSucceeded = false;
     
     if (useVectorSearch && process.env.GEMINI_API_KEY) {
@@ -1100,51 +1111,77 @@ app.post('/api/recommend', async (req, res) => {
           await buildVectorStore(allPOIs);
         }
         
-        // Semantic search using embeddings
-        const searchResults = await semanticSearch(query, 30, 0.25); // Top 30, threshold 0.25
+        // Semantic search using embeddings (get more candidates for filtering)
+        const searchResults = await semanticSearch(query, 100, 0.2); // Top 100, lower threshold
         
         if (searchResults.length > 0) {
           const retrieved = retrievePOIsFromChunks(searchResults, allPOIs);
-          relevantPOIs = retrieved.pois;
+          vectorCandidates = retrieved.pois;
           retrievedChunks = retrieved.chunks;
-          searchMethod = 'vector';
           vectorSearchSucceeded = true;
-          console.log(`✅ Vector search found ${relevantPOIs.length} POIs from ${retrievedChunks.length} chunks`);
+          console.log(`✅ Vector search found ${vectorCandidates.length} candidates from ${retrievedChunks.length} chunks`);
         } else {
-          console.log('⚠️ No results from vector search, falling back to keyword');
+          console.log('⚠️ No results from vector search');
         }
       } catch (vectorError) {
         console.error('❌ Vector search error:', vectorError.message);
-        console.log('🔄 Falling back to keyword-based search');
       }
     }
     
-    // Fallback to keyword-based search
-    if (!vectorSearchSucceeded || relevantPOIs.length === 0) {
-      searchMethod = 'keyword';
-      
-      let maxDistance = searchRadius;
-      
-      if (queryLower.includes('рядом') || queryLower.includes('близко') || queryLower.includes('пешком')) {
-        maxDistance = Math.min(searchRadius, 2);
-      } else if (queryLower.includes('далеко') || queryLower.includes('на машине')) {
-        maxDistance = Math.max(searchRadius, 20);
-      }
-      
-      if (location && location.latitude && location.longitude) {
-        relevantPOIs = filterRelevantPOIs(
-          allPOIs,
-          query,
-          location.latitude, 
-          location.longitude, 
-          maxDistance,
-          userProfile
-        ).slice(0, 100);
-      } else {
-        relevantPOIs = filterRelevantPOIs(allPOIs, query, null, null, 999, userProfile)
-          .slice(0, 100);
-      }
+    // Combine vector candidates with keyword search from ALL POIs
+    let keywordCandidates = [];
+    if (location && location.latitude && location.longitude) {
+      keywordCandidates = filterRelevantPOIs(
+        allPOIs,
+        query,
+        location.latitude, 
+        location.longitude, 
+        maxDistance,
+        userProfile
+      );
+    } else {
+      keywordCandidates = filterRelevantPOIs(allPOIs, query, null, null, 999, userProfile);
     }
+    
+    console.log(`🔍 Keyword search found ${keywordCandidates.length} candidates`);
+    
+    // MERGE: Combine vector + keyword results, prioritize vector matches
+    const mergedPOIs = new Map();
+    
+    // Add vector candidates with boost
+    if (vectorSearchSucceeded) {
+      vectorCandidates.forEach(poi => {
+        const score = (poi.vectorScore || 0.5) * 1.5 + (poi.relevanceScore || 0); // Boost vector
+        mergedPOIs.set(poi.id, { ...poi, finalScore: score, source: 'vector' });
+      });
+      searchMethod = 'vector+keyword';
+    }
+    
+    // Add keyword candidates (merge if already exists)
+    keywordCandidates.forEach(poi => {
+      if (mergedPOIs.has(poi.id)) {
+        const existing = mergedPOIs.get(poi.id);
+        existing.finalScore += poi.relevanceScore || 0; // Combine scores
+        existing.source = 'hybrid';
+      } else {
+        mergedPOIs.set(poi.id, { 
+          ...poi, 
+          finalScore: poi.relevanceScore || 0, 
+          source: 'keyword' 
+        });
+      }
+    });
+    
+    // Convert to array and sort by final score
+    relevantPOIs = Array.from(mergedPOIs.values())
+      .sort((a, b) => b.finalScore - a.finalScore)
+      .slice(0, 100); // Top 100
+    
+    if (!vectorSearchSucceeded) {
+      searchMethod = 'keyword';
+    }
+    
+    console.log(`🎯 Merged results: ${relevantPOIs.length} POIs (method: ${searchMethod})`)
     
     // Location context for AI
     let locationContext = '';
@@ -1199,6 +1236,23 @@ app.post('/api/recommend', async (req, res) => {
     if (groupSize > 1 || groupProfiles.length > 0) {
       console.log(`👥 Filtering for group (size: ${groupSize}, profiles: ${groupProfiles.join(', ')}, budget: ${budget})`);
       relevantPOIs = filterGroupFriendlyPOIs(relevantPOIs, groupSize, groupProfiles, budget, needsAccessibility);
+    }
+    
+    // FINAL SORT: Prioritize by distance if location is available
+    if (location && location.latitude && location.longitude) {
+      relevantPOIs.sort((a, b) => {
+        // Sort by distance (closer first), then by final score
+        const distDiff = (a.distance || 999) - (b.distance || 999);
+        if (Math.abs(distDiff) > 0.5) { // Significant distance difference
+          return distDiff;
+        }
+        return (b.finalScore || 0) - (a.finalScore || 0); // Same distance → use score
+      });
+      console.log(`📍 Sorted by distance + relevance`);
+    } else {
+      // No location → sort by score only
+      relevantPOIs.sort((a, b) => (b.finalScore || 0) - (a.finalScore || 0));
+      console.log(`🎯 Sorted by relevance score`);
     }
 
     console.log(`🔍 Found ${relevantPOIs.length} relevant POIs for query: "${query}"`);
